@@ -119,8 +119,7 @@ import (
 )
 
 var (
-	googleRoot  = &genomics.Mount{Disk: "google", Path: "/mnt/google"}
-	environment = make(map[string]string)
+	variables = make(map[string]string)
 
 	flags = flag.NewFlagSet("", flag.ExitOnError)
 
@@ -144,7 +143,7 @@ var (
 )
 
 func init() {
-	flags.Var(&common.MapFlagValue{environment}, "set", "sets an environment variable (e.g. NAME[=VALUE])")
+	flags.Var(&common.MapFlagValue{variables}, "set", "sets an environment variable (e.g. NAME[=VALUE])")
 }
 
 func Invoke(ctx context.Context, service *genomics.Service, project string, arguments []string) error {
@@ -208,45 +207,12 @@ func buildRequest(filename, project string) (*genomics.RunPipelineRequest, error
 		return &req, nil
 	}
 
-	var googlePaths []string
-	googlePath := func(directory string) string {
-		path := path.Join(googleRoot.Path, directory)
-		googlePaths = append(googlePaths, path)
-		return path
+	var builder pipelineBuilder
+	for _, input := range listOf(*inputs) {
+		builder.localize(input)
 	}
-
-	inputRoot := googlePath("input")
-	outputRoot := googlePath("output")
-	environment["TMPDIR"] = googlePath("tmp")
-
-	filenames := make(map[string]int)
-
-	var localizers []*genomics.Action
-	for i, input := range listOf(*inputs) {
-		filename := path.Join(inputRoot, path.Base(input))
-		filenames[filename]++
-		localizers = append(localizers, gsutil("cp", input, filename))
-		environment[fmt.Sprintf("INPUT%d", i)] = filename
-	}
-
-	var delocalizers []*genomics.Action
-	for i, output := range listOf(*outputs) {
-		filename := path.Join(outputRoot, path.Base(output))
-		filenames[filename]++
-		delocalizers = append(delocalizers, gsutil("cp", filename, output))
-		environment[fmt.Sprintf("OUTPUT%d", i)] = filename
-	}
-
-	for filename, count := range filenames {
-		if count > 1 {
-			return nil, fmt.Errorf("duplicate filename %q is not supported", filename)
-		}
-	}
-
-	if *output != "" {
-		action := gsutil("cp", "/google/logs/output", *output)
-		action.Flags = []string{"ALWAYS_RUN"}
-		delocalizers = append(delocalizers, action)
+	for _, output := range listOf(*outputs) {
+		builder.delocalize(output)
 	}
 
 	var actions []*genomics.Action
@@ -257,31 +223,35 @@ func buildRequest(filename, project string) (*genomics.RunPipelineRequest, error
 		}
 		actions = v
 	}
+	builder.add(actions...)
+
+	if *output != "" {
+		action := gsutil("cp", "/google/logs/output", *output)
+		action.Flags = []string{"ALWAYS_RUN"}
+		builder.add(action)
+	}
+
+	pipeline, err := builder.build()
+	if err != nil {
+		return nil, fmt.Errorf("building pipeline: %v", err)
+	}
 
 	zones, err := expandZones(project, listOf(*zones))
 	if err != nil {
 		return nil, fmt.Errorf("expanding zones: %v", err)
 	}
 
-	pipeline := &genomics.Pipeline{
-		Resources: &genomics.Resources{
-			ProjectId: project,
-			Zones:     zones,
-			VirtualMachine: &genomics.VirtualMachine{
-				MachineType: *machineType,
-				Preemptible: *preemptible,
-				Network: &genomics.Network{
-					UsePrivateAddress: *privateAddress,
-				},
-				ServiceAccount: &genomics.ServiceAccount{Scopes: listOf(*scopes)},
+	pipeline.Resources = &genomics.Resources{
+		ProjectId: project,
+		Zones:     zones,
+		VirtualMachine: &genomics.VirtualMachine{
+			MachineType: *machineType,
+			Preemptible: *preemptible,
+			Network: &genomics.Network{
+				UsePrivateAddress: *privateAddress,
 			},
+			ServiceAccount: &genomics.ServiceAccount{Scopes: listOf(*scopes)},
 		},
-		Environment: environment,
-	}
-
-	pipeline.Actions = []*genomics.Action{mkdir(googlePaths...)}
-	for _, v := range [][]*genomics.Action{localizers, actions, delocalizers} {
-		pipeline.Actions = append(pipeline.Actions, v...)
 	}
 
 	addRequiredDisks(pipeline)
@@ -371,7 +341,6 @@ func parse(line string) (*genomics.Action, error) {
 		ImageUri: detectImage(commands, options),
 		Commands: []string{"bash", "-c", strings.Join(commands, " ")},
 		Flags:    flags,
-		Mounts:   []*genomics.Mount{googleRoot},
 	}
 
 	if v, ok := options["ports"]; ok {
@@ -503,15 +472,6 @@ func gsutil(arguments ...string) *genomics.Action {
 	return &genomics.Action{
 		ImageUri: *cloudSDKImage,
 		Commands: append([]string{"gsutil", "-q"}, arguments...),
-		Mounts:   []*genomics.Mount{googleRoot},
-	}
-}
-
-func mkdir(arguments ...string) *genomics.Action {
-	return &genomics.Action{
-		ImageUri: *cloudSDKImage,
-		Commands: append([]string{"mkdir", "-p"}, arguments...),
-		Mounts:   []*genomics.Mount{googleRoot},
 	}
 }
 
@@ -535,4 +495,84 @@ func cancelOnInterruptOrTimeout(ctx context.Context, service *genomics.Service, 
 			fmt.Printf("Failed to cancel operation: %v\n", err)
 		}
 	}()
+}
+
+type pipelineBuilder struct {
+	actions     []*genomics.Action
+	inputs      []string
+	outputs     []string
+	directories []string
+}
+
+func (builder *pipelineBuilder) localize(remote string) {
+	builder.inputs = append(builder.inputs, remote)
+}
+
+func (builder *pipelineBuilder) delocalize(remote string) {
+	builder.outputs = append(builder.outputs, remote)
+}
+
+func (builder *pipelineBuilder) add(actions ...*genomics.Action) {
+	builder.actions = append(builder.actions, actions...)
+}
+
+func (builder *pipelineBuilder) mkdir(names ...string) string {
+	path := path.Join(names...)
+	builder.directories = append(builder.directories, path)
+	return path
+}
+
+func (builder *pipelineBuilder) build() (*genomics.Pipeline, error) {
+	google := &genomics.Mount{Disk: "google", Path: "/mnt/google"}
+
+	environment := make(map[string]string)
+	for name, value := range variables {
+		environment[name] = value
+	}
+	environment["TMPDIR"] = builder.mkdir(google.Path, "tmp")
+
+	// The first action is reserved for setup work (and populated later).
+	actions := make([]*genomics.Action, 1)
+
+	filenames := make(map[string]int)
+
+	inputRoot := path.Join(google.Path, "input")
+	for i, input := range builder.inputs {
+		filename := path.Join(inputRoot, path.Base(input))
+		filenames[filename]++
+		actions = append(actions, gsutil("cp", input, filename))
+		environment[fmt.Sprintf("INPUT%d", i)] = filename
+	}
+
+	actions = append(actions, builder.actions...)
+
+	if len(builder.outputs) > 0 {
+		outputRoot := builder.mkdir(google.Path, "output")
+		for i, output := range builder.outputs {
+			filename := path.Join(outputRoot, path.Base(output))
+			filenames[filename]++
+			actions = append(actions, gsutil("cp", filename, output))
+			environment[fmt.Sprintf("OUTPUT%d", i)] = filename
+		}
+	}
+
+	for filename, count := range filenames {
+		if count > 1 {
+			return nil, fmt.Errorf("duplicate filename %q is not supported", filename)
+		}
+	}
+
+	actions[0] = &genomics.Action{
+		ImageUri: *cloudSDKImage,
+		Commands: append([]string{"mkdir", "-p"}, builder.directories...),
+	}
+
+	for _, action := range actions {
+		action.Mounts = append(action.Mounts, google)
+	}
+
+	return &genomics.Pipeline{
+		Environment: environment,
+		Actions:     actions,
+	}, nil
 }
