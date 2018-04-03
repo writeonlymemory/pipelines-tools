@@ -211,6 +211,12 @@ func buildRequest(filename, project string) (*genomics.RunPipelineRequest, error
 		return &req, nil
 	}
 
+	for _, v := range append(inputs, outputs...) {
+		if !strings.HasPrefix(v, "gs://") {
+			return nil, fmt.Errorf("%q is not a valid GCS URL", v)
+		}
+	}
+
 	var builder pipelineBuilder
 	for _, input := range inputs {
 		builder.localize(input)
@@ -243,6 +249,10 @@ func buildRequest(filename, project string) (*genomics.RunPipelineRequest, error
 	zones, err := expandZones(project, zones)
 	if err != nil {
 		return nil, fmt.Errorf("expanding zones: %v", err)
+	}
+
+	if len(zones) == 0 {
+		return nil, errors.New("at least one zone must be specified with --zones")
 	}
 
 	pipeline.Resources = &genomics.Resources{
