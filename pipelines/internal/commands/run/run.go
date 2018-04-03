@@ -120,20 +120,20 @@ import (
 
 var (
 	variables = make(map[string]string)
+	inputs    []string
+	outputs   []string
+	zones     = []string{"us-east1-d"}
+	scopes    []string
 
 	flags = flag.NewFlagSet("", flag.ExitOnError)
 
 	basePath       = flags.String("base-path", "", "optional API service base path")
 	name           = flags.String("name", "", "optional name applied as a label")
-	scopes         = flags.String("scopes", "", "comma separated list of additional API scopes")
-	zones          = flags.String("zones", "us-east1-d", "comma separated list of zone names or prefixes (e.g. us-*)")
 	output         = flags.String("output", "", "GCS path to write output to")
 	dryRun         = flags.Bool("dry-run", false, "don't run, just show pipeline")
 	wait           = flags.Bool("wait", true, "wait for the pipeline to finish")
 	machineType    = flags.String("machine-type", "n1-standard-1", "machine type to create")
 	preemptible    = flags.Bool("preemptible", true, "use a preemptible VM")
-	inputs         = flags.String("inputs", "", "comma separated list of GCS objects to localize to the VM")
-	outputs        = flags.String("outputs", "", "comma separated list of GCS objects to delocalize from the VM")
 	diskSizeGb     = flags.Int("disk-size", 500, "the attached disk size (in GB)")
 	bootDiskSizeGb = flags.Int("boot-disk-size", 0, "if non-zero, specifies the boot disk size (in GB)")
 	privateAddress = flags.Bool("private-address", false, "use a private IP address")
@@ -144,6 +144,10 @@ var (
 
 func init() {
 	flags.Var(&common.MapFlagValue{variables}, "set", "sets an environment variable (e.g. NAME[=VALUE])")
+	flags.Var(&common.ListFlagValue{&inputs}, "inputs", "comma separated list of GCS objects to localize to the VM")
+	flags.Var(&common.ListFlagValue{&outputs}, "outputs", "comma separated list of GCS objects to delocalize from the VM")
+	flags.Var(&common.ListFlagValue{&scopes}, "scopes", "comma separated list of additional API scopes")
+	flags.Var(&common.ListFlagValue{&zones}, "zones", "comma separated list of zone names or prefixes (e.g. us-*)")
 }
 
 func Invoke(ctx context.Context, service *genomics.Service, project string, arguments []string) error {
@@ -208,10 +212,10 @@ func buildRequest(filename, project string) (*genomics.RunPipelineRequest, error
 	}
 
 	var builder pipelineBuilder
-	for _, input := range listOf(*inputs) {
+	for _, input := range inputs {
 		builder.localize(input)
 	}
-	for _, output := range listOf(*outputs) {
+	for _, output := range outputs {
 		builder.delocalize(output)
 	}
 
@@ -236,7 +240,7 @@ func buildRequest(filename, project string) (*genomics.RunPipelineRequest, error
 		return nil, fmt.Errorf("building pipeline: %v", err)
 	}
 
-	zones, err := expandZones(project, listOf(*zones))
+	zones, err := expandZones(project, zones)
 	if err != nil {
 		return nil, fmt.Errorf("expanding zones: %v", err)
 	}
@@ -250,7 +254,7 @@ func buildRequest(filename, project string) (*genomics.RunPipelineRequest, error
 			Network: &genomics.Network{
 				UsePrivateAddress: *privateAddress,
 			},
-			ServiceAccount: &genomics.ServiceAccount{Scopes: listOf(*scopes)},
+			ServiceAccount: &genomics.ServiceAccount{Scopes: scopes},
 		},
 	}
 
@@ -395,13 +399,6 @@ func addRequiredScopes(pipeline *genomics.Pipeline) {
 
 func isCloudCommand(command string) bool {
 	return command == "gsutil" || command == "gcloud"
-}
-
-func listOf(input string) []string {
-	if input == "" {
-		return nil
-	}
-	return strings.Split(input, ",")
 }
 
 func expandZones(project string, input []string) ([]string, error) {

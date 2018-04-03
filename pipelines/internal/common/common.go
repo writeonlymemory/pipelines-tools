@@ -51,3 +51,22 @@ func (m *MapFlagValue) Set(input string) error {
 	}
 	return nil
 }
+
+// ListFlagValue provides an implementation of flag.Value for comma separate
+// lists of string values.
+type ListFlagValue struct {
+	Values *[]string
+}
+
+func (m *ListFlagValue) String() string {
+	return fmt.Sprintf("%v", m.Values)
+}
+
+func (m *ListFlagValue) Set(input string) error {
+	if input == "" {
+		*m.Values = nil
+	} else {
+		*m.Values = strings.Split(input, ",")
+	}
+	return nil
+}
